@@ -1,158 +1,380 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.25;
 
-import {Script, console} from "forge-std/Script.sol";
-import {Vm} from "forge-std/Vm.sol";
-import {Factory} from "../src/Factory.sol";
-import {Competition} from "../src/Competition.sol";
+import {ISwapRouter02Minimal, IV1SwapRouter, IV2SwapRouter} from "./interfaces/ISwapRouter02Minimal.sol";
+import {ICompetition} from "./interfaces/ICompetition.sol";
 
-contract CompetitionScript is Script {
-    struct Config {
-        uint256 startTimestamp;
-        uint256 endTimestamp;
-        address router;
-        address[] stableCoins;
-        address[] swapTokens;
+import {Utils} from "./libraries/Utils.sol";
+
+import {Multicall} from "./base/Multicall.sol";
+
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable@5.0.2/access/Ownable2StepUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from
+    "@openzeppelin/contracts-upgradeable@5.0.2/utils/ReentrancyGuardUpgradeable.sol";
+import {SafeERC20, IERC20} from "@openzeppelin/contracts@5.0.2/token/ERC20/utils/SafeERC20.sol";
+
+contract Competition is
+    ICompetition,
+    ISwapRouter02Minimal,
+    ReentrancyGuardUpgradeable,
+    Ownable2StepUpgradeable,
+    Multicall
+{
+    using SafeERC20 for IERC20;
+
+    /// @inheritdoc ICompetition
+    ISwapRouter02Minimal public router;
+
+    /// @inheritdoc ICompetition
+    uint256 public startTimestamp;
+    /// @inheritdoc ICompetition
+    uint256 public endTimestamp;
+
+    /// @inheritdoc ICompetition
+    address[] public swapTokens;
+
+    mapping(address stable => bool isAllowed) public stableCoins;
+    /// @inheritdoc ICompetition
+    mapping(address account => bool exited) public isOut;
+    /// @inheritdoc ICompetition
+    mapping(address swapToken => uint256 id) public swapTokenIds;
+    /// @inheritdoc ICompetition
+    mapping(address account => mapping(address token => uint256 balance)) public balances;
+
+    /// @inheritdoc ICompetition
+    uint256 public constant MINIMAL_DEPOSIT = 10e6;
+
+    modifier onceOn() {
+        _isOnCheck();
+        _;
     }
 
-    function setUp() public {}
+    modifier notOut() {
+        _isNotOutCheck();
+        _;
+    }
 
-    function run() public {
-        Config memory config = readConfig();
+    // Disable initializers on implementation.
+    constructor() {
+        _disableInitializers();
+    }
 
-        // Set the RPC URL
-        vm.createSelectFork(vm.envString("RPC_URL"));
+    /// @inheritdoc ICompetition
+    function initialize(
+        address owner_,
+        uint256 startTimestamp_,
+        uint256 endTimestamp_,
+        address router_,
+        address[] memory stableCoins_,
+        address[] memory swapTokens_
+    ) external initializer {
+        // Initialize OwnableUpgradeable
+        __Ownable_init(owner_);
+        __ReentrancyGuard_init();
 
-        uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
+        // Ensure the validity of the timestamps.
+        if (startTimestamp_ < block.timestamp || endTimestamp_ < startTimestamp_ + 1 days) revert InvalidTimestamps();
 
-        // Adjust gas price
-        uint256 gasPrice = uint256(tx.gasprice);
+        // Ensure code is present at the specified addresses.
+        Utils._isContract(router_);
 
-        vm.startBroadcast(deployerPrivateKey);
-        vm.txGasPrice(gasPrice * 120 / 100); // 20% higher than current gas price
+        // Store values.
+        router = ISwapRouter02Minimal(router_);
+        startTimestamp = startTimestamp_;
+        endTimestamp = endTimestamp_;
 
-        // Deploy Competition through Factory
-        address factoryAddress = readFactoryAddress();
-        Factory factory = Factory(factoryAddress);
+        // This helps us avoid zero value being a swapToken id.
+        swapTokens.push(address(0xdead));
 
-        // Capture logs
-        vm.recordLogs();
+        // Add stables to the swapTokens structure and whitelist them for deposit.
+        // They're added in order to simplify the swap route check.
+        _addSwapTokens(stableCoins_, true);
 
-        factory.deploy(
-            config.startTimestamp, config.endTimestamp, config.router, config.stableCoins, config.swapTokens
-        );
+        // Add swap tokens.
+        _addSwapTokens(swapTokens_, false);
+    }
 
-        vm.stopBroadcast();
+    /// @inheritdoc ICompetition
+    function deposit(address stableCoin, uint256 amount) external notOut {
+        // Ensure competition is in progress (users can deposit before beginning).
+        if (block.timestamp > endTimestamp) revert Ended();
+        // Ensure minimum deposit is crossed.
+        if (amount < MINIMAL_DEPOSIT) revert InsufficientAmount();
+        // Ensure stable coin is approved.
+        if (!stableCoins[stableCoin]) revert InvalidToken();
+        // Make the deposit.
+        IERC20(stableCoin).safeTransferFrom(msg.sender, address(this), amount);
+        // Note the balance change.
+        balances[msg.sender][stableCoin] += amount;
+        // Emit event.
+        emit NewDeposit(msg.sender, stableCoin, amount);
+    }
 
-        // Parse logs to get the competition address
-        address competitionAddress;
-        bytes32 deployedEventSignature = keccak256("Deployed(address,address)");
-
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-
-        for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].topics[0] == deployedEventSignature) {
-                competitionAddress = address(uint160(uint256(logs[i].topics[1])));
-                break;
+    /// @inheritdoc ICompetition
+    function exit() external nonReentrant {
+        uint256 length = swapTokens.length;
+        // Flag for withdrawal of any amount of any token being made.
+        bool madeWithdrawal;
+        // Flag for leftover existence (occurs when a token is stuck).
+        bool leftoverExists;
+        for (uint256 i; i < length; i++) {
+            // Retrieve values.
+            address token = swapTokens[i];
+            uint256 balance = balances[msg.sender][token];
+            if (balance > 0) {
+                // Try to transfer tokens.
+                (bool success, bytes memory returndata) =
+                    token.call(abi.encodeWithSelector(IERC20.transfer.selector, msg.sender, balance));
+                // Support non-standard tokens that do not fail on transfer
+                if (success && (returndata.length == 0 || abi.decode(returndata, (bool)))) {
+                    // Delete user balance for the withdrawn token and mark flag.
+                    delete balances[msg.sender][token];
+                    madeWithdrawal = true;
+                } else {
+                    leftoverExists = true;
+                }
             }
         }
-
-        if (competitionAddress == address(0)) {
-            revert("Failed to retrieve Competition address from event");
+        // If user made a withdrawal and is not marked with isOut flag, mark him as being in exit process.
+        if (madeWithdrawal && !isOut[msg.sender]) {
+            isOut[msg.sender] = true;
+            emit Exit(msg.sender);
         }
-
-        console.log("Competition deployed at:", competitionAddress);
-
-        writeCompetitionDeploymentAddress(competitionAddress);
-
-        console.log("Deployment completed successfully");
+        // If there is no leftover, delete the isOut mark, then user can safely rejoin the competition.
+        if (!leftoverExists) {
+            isOut[msg.sender] = false;
+        }
     }
 
-    function readConfig() internal view returns (Config memory) {
-        string memory root = vm.projectRoot();
-        string memory configPath = string.concat(root, "/config.json");
-        string memory jsonConfig = vm.readFile(configPath);
-
-        bytes memory startTimestampBytes = vm.parseJson(jsonConfig, ".startTimestamp");
-        bytes memory endTimestampBytes = vm.parseJson(jsonConfig, ".endTimestamp");
-        bytes memory routerBytes = vm.parseJson(jsonConfig, ".router");
-        bytes memory stableCoinsBytes = vm.parseJson(jsonConfig, ".stableCoins");
-        bytes memory swapTokensBytes = vm.parseJson(jsonConfig, ".swapTokens");
-
-        address[] memory swapTokens = abi.decode(swapTokensBytes, (address[]));
-
-        return Config({
-            startTimestamp: abi.decode(startTimestampBytes, (uint256)),
-            endTimestamp: abi.decode(endTimestampBytes, (uint256)),
-            router: abi.decode(routerBytes, (address)),
-            stableCoins: abi.decode(stableCoinsBytes, (address[])),
-            swapTokens: swapTokens
-        });
+    /// @inheritdoc IV1SwapRouter
+    function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address /*to*/ )
+        external
+        onceOn
+        notOut
+        nonReentrant
+        returns (uint256 amountOut)
+    {
+        // Check path.
+        uint256 pathLength = path.length;
+        if (pathLength < 2) revert InvalidPathLength();
+        // Retrieve tokens.
+        address _tokenIn = path[0];
+        address _tokenOut = path[pathLength - 1];
+        // Validate swap parameters and approve tokens.
+        _validateSwapAndApprove(_tokenIn, _tokenOut, amountIn);
+        // Perform a swap.
+        amountOut = router.swapExactTokensForTokens(amountIn, amountOutMin, path, address(this));
+        // note down balance changes.
+        _noteSwap(_tokenIn, _tokenOut, amountIn, amountOut, SwapType.V1);
     }
 
-    function readFactoryAddress() internal view returns (address) {
-        string memory deploymentFile = "deployment.json";
-        string memory jsonContent = vm.readFile(deploymentFile);
-        console.log("Factory address:", abi.decode(vm.parseJson(jsonContent, ".FACTORY_ADDRESS"), (address)));
-        return abi.decode(vm.parseJson(jsonContent, ".FACTORY_ADDRESS"), (address));
+    /// @inheritdoc IV1SwapRouter
+    function swapTokensForExactTokens(uint256 amountOut, uint256 amountInMax, address[] calldata path, address /*to*/ )
+        external
+        onceOn
+        notOut
+        nonReentrant
+        returns (uint256 amountIn)
+    {
+        // Check path.
+        uint256 pathLength = path.length;
+        if (pathLength < 2) revert InvalidPathLength();
+        // Retrieve tokens.
+        address _tokenIn = path[0];
+        address _tokenOut = path[pathLength - 1];
+        // Validate swap parameters and approve tokens.
+        _validateSwapAndApprove(_tokenIn, _tokenOut, amountInMax);
+        // Perform a swap.
+        amountIn = router.swapTokensForExactTokens(amountOut, amountInMax, path, address(this));
+        // Nullify allowance.
+        IERC20(_tokenIn).forceApprove(address(router), 0);
+        // Note swap state changes.
+        _noteSwap(_tokenIn, _tokenOut, amountIn, amountOut, SwapType.V1);
     }
 
-    function writeCompetitionDeploymentAddress(address competitionAddress) internal {
-        string memory deploymentFile = "deployment.json";
-        string memory jsonContent = vm.readFile(deploymentFile);
-
-        // Parse existing JSON content
-        bytes memory factoryAddressBytes = vm.parseJson(jsonContent, ".FACTORY_ADDRESS");
-        bytes memory implementationAddressBytes = vm.parseJson(jsonContent, ".COMPETITION_IMPLEMENTATION_ADDRESS");
-        bytes memory competitionAddressesBytes = vm.parseJson(jsonContent, ".COMPETITION_ADDRESSES");
-
-        // Decode existing competition addresses
-        address[] memory existingAddresses;
-        if (competitionAddressesBytes.length > 0) {
-            existingAddresses = abi.decode(competitionAddressesBytes, (address[]));
-        }
-
-        // Create new array with additional address
-        address[] memory newAddresses = new address[](existingAddresses.length + 1);
-        for (uint256 i = 0; i < existingAddresses.length; i++) {
-            newAddresses[i] = existingAddresses[i];
-        }
-        newAddresses[existingAddresses.length] = competitionAddress;
-
-        // Create updated JSON content
-        string memory updatedJsonContent = string.concat(
-            "{\n",
-            '    "FACTORY_ADDRESS": "',
-            vm.toString(abi.decode(factoryAddressBytes, (address))),
-            '",\n',
-            '    "COMPETITION_IMPLEMENTATION_ADDRESS": "',
-            vm.toString(abi.decode(implementationAddressBytes, (address))),
-            '",\n',
-            '    "COMPETITION_ADDRESSES": ',
-            addressArrayToJsonString(newAddresses),
-            "\n",
-            "}"
-        );
-
-        // Write updated JSON content back to the file
-        vm.writeFile(deploymentFile, updatedJsonContent);
-
-        console.log("Added new Competition address:", competitionAddress);
+    /// @inheritdoc IV2SwapRouter
+    function exactInputSingle(ExactInputSingleParams memory params)
+        external
+        onceOn
+        notOut
+        nonReentrant
+        returns (uint256 amountOut)
+    {
+        // Retrieve swap data.
+        address _tokenIn = params.tokenIn;
+        address _tokenOut = params.tokenOut;
+        uint256 _amountIn = params.amountIn;
+        // Override recipient.
+        params.recipient = address(this);
+        // Validate swap parameters and approve tokens.
+        _validateSwapAndApprove(_tokenIn, _tokenOut, _amountIn);
+        // Perform a swap.
+        amountOut = router.exactInputSingle(params);
+        // Note swap state changes.
+        _noteSwap(_tokenIn, _tokenOut, _amountIn, amountOut, SwapType.V2);
     }
 
-    function addressArrayToJsonString(address[] memory addresses) internal pure returns (string memory) {
-        if (addresses.length == 0) {
-            return "[]";
-        }
+    /// @inheritdoc IV2SwapRouter
+    function exactInput(ExactInputParams memory params)
+        external
+        onceOn
+        notOut
+        nonReentrant
+        returns (uint256 amountOut)
+    {
+        // Check path.
+        bytes memory path = params.path;
+        _pathLengthCheck(path);
+        // Retrieve swap data.
+        (address _tokenIn, address _tokenOut) = _getTokensFromV2Path(path);
+        uint256 _amountIn = params.amountIn;
+        // Override recipient.
+        params.recipient = address(this);
+        // Validate swap parameters and approve tokens.
+        _validateSwapAndApprove(_tokenIn, _tokenOut, _amountIn);
+        // Perform a swap.
+        amountOut = router.exactInput(params);
+        // Note swap state changes.
+        _noteSwap(_tokenIn, _tokenOut, _amountIn, amountOut, SwapType.V2);
+    }
 
-        string memory result = "[\n        ";
-        for (uint256 i = 0; i < addresses.length; i++) {
-            if (i > 0) {
-                result = string.concat(result, ",\n        ");
+    /// @inheritdoc IV2SwapRouter
+    function exactOutputSingle(ExactOutputSingleParams memory params)
+        external
+        onceOn
+        notOut
+        nonReentrant
+        returns (uint256 amountIn)
+    {
+        // Retrieve tokens.
+        address _tokenOut = params.tokenOut;
+        address _tokenIn = params.tokenIn;
+        // Override recipient.
+        params.recipient = address(this);
+        // Validate swap parameters and approve tokens.
+        _validateSwapAndApprove(_tokenIn, _tokenOut, params.amountInMaximum);
+        // Perfrom a swap.
+        amountIn = router.exactOutputSingle(params);
+        // Nullify allowance.
+        IERC20(_tokenIn).forceApprove(address(router), 0);
+        // Note swap state changes.
+        _noteSwap(_tokenIn, _tokenOut, amountIn, params.amountOut, SwapType.V2);
+    }
+
+    /// @inheritdoc IV2SwapRouter
+    function exactOutput(ExactOutputParams memory params)
+        external
+        onceOn
+        notOut
+        nonReentrant
+        returns (uint256 amountIn)
+    {
+        // Check path.
+        bytes memory path = params.path;
+        _pathLengthCheck(path);
+        // Retrieve tokens.
+        (address _tokenOut, address _tokenIn) = _getTokensFromV2Path(path);
+        // Override recipient.
+        params.recipient = address(this);
+        // Validate swap parameters and approve tokens.
+        _validateSwapAndApprove(_tokenIn, _tokenOut, params.amountInMaximum);
+        // Perfrom a swap.
+        amountIn = router.exactOutput(params);
+        // Nullify allowance.
+        IERC20(_tokenIn).forceApprove(address(router), 0);
+        // Note swap state changes.
+        _noteSwap(_tokenIn, _tokenOut, amountIn, params.amountOut, SwapType.V2);
+    }
+
+    /// @inheritdoc ICompetition
+    function addSwapTokens(address[] memory swapTokens_, bool stableCoins_) external onlyOwner {
+        _addSwapTokens(swapTokens_, stableCoins_);
+    }
+
+    /// @inheritdoc ICompetition
+    function isSwapToken(address token) public view returns (bool) {
+        // Token having an id implies that it is added to the swapTokens array.
+        return swapTokenIds[token] > 0;
+    }
+
+    function _addSwapTokens(address[] memory _swapTokens, bool _stableCoins) private {
+        // Gas opt
+        uint256 _length = _swapTokens.length;
+        uint256 length = swapTokens.length;
+        for (uint256 i; i < _length; ++i) {
+            address _token = _swapTokens[i];
+            // Ensure there is code at the specified address
+            Utils._isContract(_token);
+            if (_stableCoins)   stableCoins[_token] = true;
+            // Add token if it is not already present
+            if (!isSwapToken(_token)) {
+                swapTokenIds[_token] = length++;
+                swapTokens.push(_token);
+                emit SwapTokenAdded(_token);
             }
-            result = string.concat(result, '"', vm.toString(addresses[i]), '"');
         }
-        result = string.concat(result, "\n    ]");
-        return result;
+    }
+
+    /**
+     * @dev Function to retrieve first and last token from a V2 path.
+     * @param path is a V2 path byte-string.
+     */
+    function _getTokensFromV2Path(bytes memory path) private pure returns (address firstToken, address lastToken) {
+        firstToken = Utils._toAddress(path, 0);
+        lastToken = Utils._toAddress(path, path.length - 20);
+    }
+
+    /**
+     * @dev Function to validate swap parameters and prepare state for a swap.
+     */
+    function _validateSwapAndApprove(address _tokenIn, address _tokenOut, uint256 _amountIn) private {
+        // Check input amount.
+        if (_amountIn == 0) revert InvalidAmountIn();
+        // Ensure that both _tokenIn and _tokenOut are swappable inside the competition.
+        if (!isSwapToken(_tokenIn) || !isSwapToken(_tokenOut)) {
+            revert InvalidRoute();
+        }
+        // Ensure that the competition participant has sufficient amount of tokens.
+        if (balances[msg.sender][_tokenIn] < _amountIn) revert InsufficientBalance();
+        // Approve specified token amount to the router.
+        IERC20(_tokenIn).forceApprove(address(router), _amountIn);
+    }
+
+    /**
+     * @dev Function to note down balance change after swap and emit an event with relevant information.
+     */
+    function _noteSwap(address _tokenIn, address _tokenOut, uint256 _amountIn, uint256 _amountOut, SwapType _swapType)
+        private
+    {
+        // Decrease _tokenIn balance
+        balances[msg.sender][_tokenIn] -= _amountIn;
+        // Increase _tokenOut balance.
+        balances[msg.sender][_tokenOut] += _amountOut;
+        // Emit event.
+        emit NewSwap(msg.sender, _tokenIn, _tokenOut, _amountIn, _amountOut, _swapType);
+    }
+
+    /**
+     * @dev Ensure that the competition is in progress.
+     */
+    function _isOnCheck() private view {
+        if (block.timestamp < startTimestamp) revert NotOnYet();
+        if (block.timestamp > endTimestamp) revert IsEnded();
+    }
+
+    /**
+     * @dev Ensure that caller is not in the process of leaving the competition.
+     */
+    function _isNotOutCheck() private view {
+        if (isOut[msg.sender]) revert AlreadyLeft();
+    }
+
+    /**
+     * @dev Path consists of addresses and fees (like: addr + fee + addr + fee),
+     * therefore in order to contain a single swap path should be at least 43 bytes long (2 addresses + uint24 fee).
+     * The other check ensures path length fits the format.
+     */
+    function _pathLengthCheck(bytes memory path) private pure {
+        if (path.length < 43 || (path.length - 20) % 23 != 0) revert InvalidPathLength();
     }
 }
